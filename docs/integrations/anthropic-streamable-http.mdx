@@ -1,0 +1,122 @@
+# Anthropic Integrations: Streamable HTTP MCP Server
+
+This guide explains how to expose your **OpenMemory MCP server** over the new _Streamable HTTP_ transport (MCP specification 2025-03-26), secure it with per-user Bearer tokens, and register it as a **remote MCP Integration** with Anthropic.
+
+---
+
+## 1. Endpoint specification
+
+| Verb | Path                                    | Description |
+|------|-----------------------------------------|-------------|
+| GET  | `/mcp/{client_name}/{user_id}`          | Opens a long-lived **SSE** stream for server-initiated JSON-RPC messages. Requires `Accept: text/event-stream`. |
+| POST | `/mcp/{client_name}/{user_id}`          | Sends one JSON-RPC batch to the server. Return mode depends on `Accept` header.<br/>• `Accept: text/event-stream` ⇒ responses streamed as SSE.<br/>• Otherwise ⇒ single JSON payload.<br/>If the batch contains only notifications/responses, server returns **202 Accepted** with empty body. |
+
+### Headers (both GET & POST)
+
+* `Authorization: Bearer <token>` — **required**. The token must belong to `user_id`.
+* `Accept: text/event-stream` – set when you expect streaming.
+* `Content-Type: application/json` – for POST bodies.
+
+---
+
+## 2. Authentication
+
+| Field | Model |
+|-------|-------|
+| Table | `api_tokens` |
+| ORM   | `app.models.ApiToken` |
+
+A token row has:
+
+* `token` – 64-hex-char random string
+* `user_id` – owning user
+* `revoked_at` – `NULL` ⇢ active, otherwise revoked
+
+FastAPI dependency `app.auth.authenticate_user` validates the header and injects `current_user` into the route. If the token's user does **not** match the `user_id` path parameter the request is rejected with **403**.
+
+### Creating tokens
+
+* **Dev convenience**: On first startup a default token is generated for the default user and printed to stdout (look for `[Dev] Generated default bearer token: …`).
+* **Production**: build a simple admin endpoint or use direct SQL — insert into `api_tokens` and hand the token to the user.
+
+---
+
+## 3. Example requests
+
+### Streamed response
+```bash
+curl -N \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  https://mem0.example.com/mcp/my_app/$USER_ID
+```
+
+### Single JSON response
+```bash
+curl \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tool/echo","params":{"text":"ping"}}' \
+  https://mem0.example.com/mcp/my_app/$USER_ID
+```
+
+---
+
+## 4. Deploying over HTTPS
+
+Anthropic only accepts HTTPS endpoints signed by a public CA. Recommended options:
+
+1. **Cloudflare Tunnel** (zero-config)
+   ```bash
+   cloudflared tunnel run mem0-api   # prints https://… trycloudflare.com
+   ```
+2. **Caddy** (automatic Let's Encrypt)
+   ```bash
+   caddy reverse-proxy \
+     --from https://mem0.example.com \
+     --to 127.0.0.1:8000
+   ```
+3. **Traefik** in Docker Compose (LE resolver).  
+4. **NGINX + certbot** classic.
+
+The FastAPI app itself keeps listening on **HTTP** (`uvicorn 0.0.0.0:8000`). TLS is terminated at the proxy.
+
+---
+
+## 5. Registering with Anthropic "Integrations"
+
+1. Deploy your server with HTTPS as above.
+2. Obtain or create a Bearer token for the user account Claude should act as.
+3. In Claude → **Settings › Integrations › Add custom integration** enter:
+   * MCP endpoint: `https://mem0.example.com/mcp` **(without trailing slash)**
+   * Bearer token: paste token value.
+4. Claude will send `InitializeRequest`; verify in your logs.
+5. Approve tools you want Claude to invoke.
+
+> **Tip**  Use `CREATE TOKEN` per user/team and revoke via `revoked_at` whenever needed.
+
+---
+
+## 6. Security checklist
+
+* [ ] Reverse-proxy validates `Origin` header or binds to `127.0.0.1`.
+* [ ] Rate-limit IPs or require API Gateway keys if the service is not public.
+* [ ] Rotate or revoke tokens via `revoked_at`.
+* [ ] Enable HTTPS redirect middleware if you expose the app directly.
+* [ ] Legacy `/mcp/messages` SSE routes either removed or protected with the same dependency.
+
+---
+
+## 7. Backwards compatibility
+
+The legacy SSE transport (`/mcp/messages/…`) is still available but **deprecated**. Clients should migrate to the unified Streamable-HTTP endpoint. You can disable the old routes by editing `mcp_server.py` once migration is complete.
+
+---
+
+### Revision history
+
+| Version | Date | Notes |
+|---------|------|-------|
+| 1.0     | 2025-06-29 | Initial draft – code changes for Streamable HTTP + Bearer auth + HTTPS deployment. 

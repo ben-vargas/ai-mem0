@@ -231,3 +231,31 @@ def after_memory_update(mapper, connection, target):
     db = Session(bind=connection)
     categorize_memory(target, db)
     db.close()
+
+
+# ----------------------------
+# API Token model for per-user Bearer token authentication
+# ----------------------------
+
+
+class ApiToken(Base):
+    """Represents a long-lived bearer token associated with a user.
+
+    Tokens are used for authenticating remote MCP requests (e.g. Anthropic
+    "Integrations") via an ``Authorization: Bearer <token>`` HTTP header.
+    """
+
+    __tablename__ = "api_tokens"
+
+    id = Column(UUID, primary_key=True, default=lambda: uuid.uuid4())
+    user_id = Column(UUID, ForeignKey("users.id"), nullable=False, index=True)
+    token = Column(String, unique=True, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=get_current_utc_time, index=True)
+    revoked_at = Column(DateTime, nullable=True, index=True)
+
+    user = relationship("User")
+
+    __table_args__ = (
+        Index('idx_api_token_user', 'user_id', 'token'),
+    )

@@ -5,7 +5,7 @@ from app.mcp_server import setup_mcp_server
 from app.routers import memories_router, apps_router, stats_router, config_router
 from fastapi_pagination import add_pagination
 from fastapi.middleware.cors import CORSMiddleware
-from app.models import User, App
+from app.models import User, App, ApiToken
 from uuid import uuid4
 from app.config import USER_ID, DEFAULT_APP_ID
 
@@ -70,9 +70,28 @@ def create_default_app():
     finally:
         db.close()
 
-# Create default user on startup
+def create_default_api_token():
+    """Ensure a default bearer token exists for the default user (dev only)."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.user_id == USER_ID).first()
+        if not user:
+            return
+        existing = db.query(ApiToken).filter(ApiToken.user_id == user.id).first()
+        if not existing:
+            import secrets
+            token_value = secrets.token_hex(32)
+            api_token = ApiToken(user_id=user.id, token=token_value, description="Default dev token")
+            db.add(api_token)
+            db.commit()
+            print("[Dev] Generated default bearer token:", token_value)
+    finally:
+        db.close()
+
+# Create default user and token on startup
 create_default_user()
 create_default_app()
+create_default_api_token()
 
 # Setup MCP server
 setup_mcp_server(app)

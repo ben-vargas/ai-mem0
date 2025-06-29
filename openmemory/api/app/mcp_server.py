@@ -20,7 +20,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from app.utils.memory import get_memory_client
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.routing import APIRouter
 import contextvars
 import os
@@ -32,6 +32,9 @@ import uuid
 import datetime
 from app.utils.permissions import check_memory_access_permissions
 from qdrant_client import models as qdrant_models
+import asyncio
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from app.auth import authenticate_user
 
 # Load environment variables
 load_dotenv()
@@ -57,6 +60,139 @@ mcp_router = APIRouter(prefix="/mcp")
 
 # Initialize SSE transport
 sse = SseServerTransport("/mcp/messages/")
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP unified endpoint (MCP 2025-03-26 spec)
+# ---------------------------------------------------------------------------
+
+async def _create_read_fn(body: bytes):
+    """Return coroutine that yields *body* exactly once then None."""
+    delivered = False
+
+    async def _read():
+        nonlocal delivered, body
+        if delivered:
+            return None
+        delivered = True
+        return body
+
+    return _read
+
+
+def _is_request_message(msg: dict) -> bool:
+    """Whether *msg* is a JSON-RPC *request* (method + id)."""
+    return isinstance(msg, dict) and "method" in msg and "id" in msg
+
+
+def _contains_request(payload) -> bool:
+    if isinstance(payload, list):
+        return any(_is_request_message(x) for x in payload)
+    return _is_request_message(payload)
+
+
+async def _sse_queue_generator(queue):
+    """Async generator that converts bytes from *queue* to SSE events."""
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        yield f"data: {item.decode()}\n\n".encode()
+
+
+@mcp_router.api_route("/{client_name}/{user_id}", methods=["GET", "POST"])
+async def handle_streamable_http(
+    request: Request,
+    client_name: str,
+    user_id: str,
+    current_user=Depends(authenticate_user),
+):
+    """Unified Streamable HTTP endpoint replacing legacy SSE routes."""
+
+    # Validate token's user matches path param for safety
+    if current_user.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Path user_id does not match bearer token user")
+
+    # Context vars ensure downstream tool calls see the correct user/app
+    user_token = user_id_var.set(user_id)
+    client_token = client_name_var.set(client_name)
+
+    try:
+        accepts = request.headers.get("accept", "").lower()
+        want_sse = "text/event-stream" in accepts
+
+        init_opts = mcp._mcp_server.create_initialization_options()
+
+        # ------------------------------ GET --------------------------------
+        if request.method == "GET":
+            if not want_sse:
+                return Response(status_code=405, content="Accept header must include text/event-stream for GET")
+
+            queue = asyncio.Queue()
+
+            async def read():
+                return None  # no inbound data on listen stream
+
+            async def write(message: bytes):
+                await queue.put(message)
+
+            async def _run():
+                await mcp._mcp_server.run(read, write, init_opts)
+                await queue.put(None)
+
+            asyncio.create_task(_run())
+
+            return StreamingResponse(_sse_queue_generator(queue), media_type="text/event-stream")
+
+        # ------------------------------ POST -------------------------------
+        body = await request.body()
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            return Response(status_code=400, content="Invalid JSON body")
+
+        if not _contains_request(parsed):
+            read = await _create_read_fn(body)
+
+            async def write(_):
+                pass  # server shouldn't send anything back
+
+            await mcp._mcp_server.run(read, write, init_opts)
+            return Response(status_code=202)
+
+        if want_sse:
+            queue = asyncio.Queue()
+
+            read = await _create_read_fn(body)
+
+            async def write(message: bytes):
+                await queue.put(message)
+
+            async def _run():
+                await mcp._mcp_server.run(read, write, init_opts)
+                await queue.put(None)
+
+            asyncio.create_task(_run())
+            return StreamingResponse(_sse_queue_generator(queue), media_type="text/event-stream")
+
+        # Fallback: gather responses and reply as JSON
+        collected = []
+
+        read = await _create_read_fn(body)
+
+        async def write(message: bytes):
+            try:
+                collected.append(json.loads(message))
+            except Exception:
+                collected.append(message.decode())
+
+        await mcp._mcp_server.run(read, write, init_opts)
+
+        payload = collected[0] if len(collected) == 1 else collected
+        return JSONResponse(payload)
+
+    finally:
+        user_id_var.reset(user_token)
+        client_name_var.reset(client_token)
 
 @mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something.")
 async def add_memories(text: str) -> str:
